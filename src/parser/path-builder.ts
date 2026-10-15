@@ -3,12 +3,14 @@ import {
   Decorator,
   MethodDeclaration,
   Node,
+  ObjectLiteralExpression,
   ParameterDeclaration,
   Type,
 } from 'ts-morph';
 import type { NestParserHooks } from '../config/types';
 import type { OpenApiResponse, OpenApiSchema, OpenApiSecurityRequirement } from '../types/openapi';
 import { AstIndex } from './ast-index';
+import type { ResolvedVersioning } from './bootstrap';
 import { SchemaBuilder } from './schema-builder';
 import { filterScopedComments, getScopes, getTags, isVisible } from './tags';
 
@@ -90,8 +92,20 @@ function humanizeMethodName(name: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
+/**
+ * A resolved version requirement from `@Controller({ version })` or `@Version`.
+ * `neutral` is `VERSION_NEUTRAL` (route stays unversioned); otherwise `versions`
+ * holds one or more explicit versions.
+ */
+interface VersionSpec {
+  neutral: boolean;
+  versions: string[];
+}
+
 export interface PathBuilderOptions {
   globalPrefix?: string;
+  /** Resolved URI versioning. Non-URI types are ignored here (they don't affect paths). */
+  versioning?: ResolvedVersioning;
   hooks?: NestParserHooks;
   registeredSchemes?: string[];
   activeScopes?: Set<string>;
@@ -116,6 +130,8 @@ export class PathBuilder {
    */
   private readonly usedTagNames = new Set<string>();
   private readonly globalPrefix: string;
+  /** URI version prefix + default versions, or null when versioning is off or non-URI. */
+  private readonly versioning: ResolvedVersioning | null;
   private readonly hooks: NestParserHooks;
   private readonly registeredSchemes: string[];
   private readonly activeScopes: Set<string>;
@@ -127,6 +143,7 @@ export class PathBuilder {
     options: PathBuilderOptions = {},
   ) {
     this.globalPrefix = options.globalPrefix ?? '';
+    this.versioning = options.versioning?.type === 'uri' ? options.versioning : null;
     this.hooks = options.hooks ?? {};
     this.registeredSchemes = options.registeredSchemes ?? [];
     this.activeScopes = options.activeScopes ?? new Set();
@@ -164,10 +181,11 @@ export class PathBuilder {
   private processController(controller: ClassDeclaration): void {
     if (!isVisible(getScopes(getTags(controller)), this.activeScopes)) return;
 
-    // @Controller and the route decorators each accept `string | string[]`; an
+    // @Controller accepts `string | string[]` or an options object
+    // (`{ path, version }`); the route decorators accept `string | string[]`. An
     // array prefix/path means the handler is mapped to several routes at once.
-    const basePathArgs = this.stringArgs(controller.getDecorator('Controller'), 0);
-    const basePaths = basePathArgs.length ? basePathArgs : [''];
+    const { paths: basePaths, version: controllerVersion } =
+      this.parseControllerDecorator(controller);
     const controllerTagBag = getTags(controller);
     const tag =
       controllerTagBag.Tag?.[0] ?? (this.hooks.controllerTag ?? this.defaultTag)(controller);
@@ -193,30 +211,106 @@ export class PathBuilder {
       const routeArgs = this.stringArgs(httpDecorator, 0);
       const routePaths = routeArgs.length ? routeArgs : [''];
       const methodTag = getTags(method).Tag?.[0] ?? tag;
+      // A method-level `@Version` overrides the controller's `{ version }` option.
+      const version = this.readMethodVersion(method) ?? controllerVersion;
 
-      // One operation per (controller prefix × route path × optional-param
-      // expansion) combination. Each gets its own operationId (uniqueOperationId
-      // de-dups) and its own path params, since placeholders can differ per path.
-      for (const base of basePaths) {
-        for (const route of routePaths) {
-          const rawPath = this.joinPath(this.globalPrefix, base, route);
-          for (const fullPath of this.expandRoutePaths(rawPath, controller, method)) {
-            this.usedTagNames.add(methodTag);
-            const templateParams = this.pathParamNames(fullPath);
-            const operation = this.buildOperation(
-              controller,
-              method,
-              httpMethod,
-              methodTag,
-              templateParams,
-            );
+      // One operation per (version × controller prefix × route path × optional-
+      // param expansion) combination. Each gets its own operationId
+      // (uniqueOperationId de-dups) and its own path params, since placeholders
+      // can differ per path. A version segment ('' when unversioned/VERSION_NEUTRAL)
+      // sits between the global prefix and the controller base: /api/v1/users.
+      for (const versionSeg of this.versionSegments(version)) {
+        for (const base of basePaths) {
+          for (const route of routePaths) {
+            const rawPath = this.joinPath(this.globalPrefix, versionSeg, base, route);
+            for (const fullPath of this.expandRoutePaths(rawPath, controller, method)) {
+              this.usedTagNames.add(methodTag);
+              const templateParams = this.pathParamNames(fullPath);
+              const operation = this.buildOperation(
+                controller,
+                method,
+                httpMethod,
+                methodTag,
+                templateParams,
+              );
 
-            this.paths[fullPath] ??= {};
-            this.paths[fullPath][httpMethod] = operation;
+              this.paths[fullPath] ??= {};
+              this.paths[fullPath][httpMethod] = operation;
+            }
           }
         }
       }
     }
+  }
+
+  /**
+   * Parse the `@Controller(...)` decorator. Accepts the positional form
+   * (`@Controller('path')` / `@Controller(['a', 'b'])`) and the options-object
+   * form (`@Controller({ path, version })`). Returns the base route path(s)
+   * (defaulting to `['']` for a root controller) and the controller-level
+   * version, which NestJS carries in the object's `version` field — NOT via a
+   * `@Version` class decorator.
+   */
+  private parseControllerDecorator(controller: ClassDeclaration): {
+    paths: string[];
+    version: VersionSpec | undefined;
+  } {
+    const dec = controller.getDecorator('Controller');
+    const arg = dec?.getArguments()[0];
+
+    if (arg && Node.isObjectLiteralExpression(arg)) {
+      const paths = this.stringLiterals(this.objectProp(arg, 'path'));
+      return {
+        paths: paths.length ? paths : [''],
+        version: this.readVersionSpec(this.objectProp(arg, 'version')),
+      };
+    }
+
+    const paths = this.stringArgs(dec, 0);
+    return { paths: paths.length ? paths : [''], version: undefined };
+  }
+
+  /** Read a method-level `@Version(...)` decorator, or undefined when absent. */
+  private readMethodVersion(method: MethodDeclaration): VersionSpec | undefined {
+    const dec = method.getDecorator('Version');
+    if (!dec) return undefined;
+    return this.readVersionSpec(dec.getArguments()[0]);
+  }
+
+  /**
+   * Version URI segments to emit for a route — one operation per segment. Empty
+   * string means "no version segment" (versioning off, `VERSION_NEUTRAL`, or no
+   * version and no `defaultVersion`). Each version becomes `${prefix}${version}`
+   * (e.g. `v1`).
+   */
+  private versionSegments(version: VersionSpec | undefined): string[] {
+    if (!this.versioning) return [''];
+    if (version?.neutral) return [''];
+
+    const versions = version ? version.versions : this.versioning.defaultVersion;
+    if (versions.length === 0) return [''];
+
+    return versions.map((v) => `${this.versioning!.prefix}${v}`);
+  }
+
+  /**
+   * Interpret a version argument — a string, string[], or `VERSION_NEUTRAL`
+   * identifier. Returns undefined when absent; a non-literal/dynamic argument
+   * falls back to neutral (best-effort).
+   */
+  private readVersionSpec(node: Node | undefined): VersionSpec | undefined {
+    if (!node) return undefined;
+    if (Node.isIdentifier(node) && node.getText() === 'VERSION_NEUTRAL') {
+      return { neutral: true, versions: [] };
+    }
+    const versions = this.stringLiterals(node);
+    return versions.length ? { neutral: false, versions } : { neutral: true, versions: [] };
+  }
+
+  /** Initializer of a named property in an object literal, or undefined. */
+  private objectProp(obj: ObjectLiteralExpression, name: string): Node | undefined {
+    const prop = obj.getProperty(name);
+    return prop && Node.isPropertyAssignment(prop) ? prop.getInitializer() : undefined;
   }
 
   private buildOperation(
@@ -604,14 +698,21 @@ export class PathBuilder {
    * Non-string and dynamic entries are skipped; the result is empty when absent.
    */
   private stringArgs(decorator: Decorator | undefined, index: number): string[] {
-    if (!decorator) return [];
-    const arg = decorator.getArguments()[index];
-    if (!arg) return [];
+    return this.stringLiterals(decorator?.getArguments()[index]);
+  }
+
+  /**
+   * Distinct string values from a node that is a string literal or an array of
+   * string literals (`'a'` or `['a', 'b']`). Non-string/dynamic entries are
+   * skipped; empty when the node is absent or neither form.
+   */
+  private stringLiterals(node: Node | undefined): string[] {
+    if (!node) return [];
     let values: string[] = [];
-    if (Node.isStringLiteral(arg)) {
-      values = [arg.getLiteralValue()];
-    } else if (Node.isArrayLiteralExpression(arg)) {
-      values = arg
+    if (Node.isStringLiteral(node)) {
+      values = [node.getLiteralValue()];
+    } else if (Node.isArrayLiteralExpression(node)) {
+      values = node
         .getElements()
         .filter(Node.isStringLiteral)
         .map((el) => el.getLiteralValue());
