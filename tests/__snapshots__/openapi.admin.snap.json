@@ -1398,6 +1398,15 @@
               "DRAFT",
               "PUBLISHED"
             ]
+          },
+          "tagIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "maxItems": 20,
+            "description": "Up to 20 tag ids to attach."
           }
         },
         "required": [
