@@ -20,7 +20,35 @@ const HTTP_METHODS: Record<string, string> = {
   Put: 'put',
   Delete: 'delete',
   Patch: 'patch',
+  Head: 'head',
+  Options: 'options',
+  // @Sse() is an HTTP GET that streams text/event-stream (see SSE_MEDIA_TYPE).
+  Sse: 'get',
 };
+
+// @All() registers a handler for every verb. OpenAPI has no wildcard method, so
+// it expands to one operation per verb (operationIds de-dup, bodies/responses
+// are identical). ponytail: covers the common `@All()` catch-all; no per-verb
+// divergence because a single handler can't branch its contract by verb anyway.
+const ALL_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'options', 'head'];
+
+// NestJS v11's `@Sse(path, { [METHOD_METADATA]: RequestMethod.X })` can override
+// the streaming verb (default GET). RequestMethod members (ordinal order, from
+// @nestjs/common) → the OpenAPI verb(s) they emit. ALL fans out like @All();
+// SEARCH has no OpenAPI path-item verb, so it degrades to the GET default.
+// Harmless on v10, where @Sse() takes no options object.
+const REQUEST_METHODS: Record<string, string[]> = {
+  GET: ['get'],
+  POST: ['post'],
+  PUT: ['put'],
+  DELETE: ['delete'],
+  PATCH: ['patch'],
+  ALL: ALL_METHODS,
+  OPTIONS: ['options'],
+  HEAD: ['head'],
+  SEARCH: ['get'],
+};
+const REQUEST_METHOD_ORDER = Object.keys(REQUEST_METHODS);
 
 // Media type used for request bodies and responses unless an endpoint overrides
 // it with `@Accept` (request) or `@ContentType` (response) in its JSDoc.
@@ -29,6 +57,9 @@ const DEFAULT_MEDIA_TYPE = 'application/json';
 // Default request media type for endpoints with a file upload (binary data
 // can't ride in JSON), used unless `@Accept` says otherwise.
 const MULTIPART_MEDIA_TYPE = 'multipart/form-data';
+
+// Response media type for `@Sse()` handlers, unless `@ContentType` overrides it.
+const SSE_MEDIA_TYPE = 'text/event-stream';
 
 // NestJS's `HttpStatus` enum (from `@nestjs/common`) member name → numeric code.
 // Used to resolve `@HttpCode(HttpStatus.NO_CONTENT)` statically, since we can't
@@ -204,10 +235,18 @@ export class PathBuilder {
     for (const method of controller.getInstanceMethods()) {
       if (!isVisible(getScopes(getTags(method)), this.activeScopes)) continue;
 
-      const httpDecorator = method.getDecorators().find((d) => HTTP_METHODS[d.getName()]);
+      const httpDecorator = method
+        .getDecorators()
+        .find((d) => d.getName() === 'All' || HTTP_METHODS[d.getName()]);
       if (!httpDecorator) continue;
 
-      const httpMethod = HTTP_METHODS[httpDecorator.getName()];
+      const decName = httpDecorator.getName();
+      const httpMethods =
+        decName === 'All'
+          ? ALL_METHODS
+          : decName === 'Sse'
+            ? this.sseMethods(httpDecorator)
+            : [HTTP_METHODS[decName]];
       const routeArgs = this.stringArgs(httpDecorator, 0);
       const routePaths = routeArgs.length ? routeArgs : [''];
       const methodTag = getTags(method).Tag?.[0] ?? tag;
@@ -226,16 +265,18 @@ export class PathBuilder {
             for (const fullPath of this.expandRoutePaths(rawPath, controller, method)) {
               this.usedTagNames.add(methodTag);
               const templateParams = this.pathParamNames(fullPath);
-              const operation = this.buildOperation(
-                controller,
-                method,
-                httpMethod,
-                methodTag,
-                templateParams,
-              );
+              for (const httpMethod of httpMethods) {
+                const operation = this.buildOperation(
+                  controller,
+                  method,
+                  httpMethod,
+                  methodTag,
+                  templateParams,
+                );
 
-              this.paths[fullPath] ??= {};
-              this.paths[fullPath][httpMethod] = operation;
+                this.paths[fullPath] ??= {};
+                this.paths[fullPath][httpMethod] = operation;
+              }
             }
           }
         }
@@ -268,6 +309,33 @@ export class PathBuilder {
 
     const paths = this.stringArgs(dec, 0);
     return { paths: paths.length ? paths : [''], version: undefined };
+  }
+
+  /**
+   * Resolve the verb(s) an `@Sse()` endpoint emits. Defaults to GET; NestJS v11's
+   * options object (`@Sse('x', { [METHOD_METADATA]: RequestMethod.POST })`) can
+   * override it. The key is a computed constant we can't read statically, so we
+   * match on the value — a `RequestMethod.X` member access or its numeric
+   * ordinal — and ignore everything else.
+   */
+  private sseMethods(decorator: Decorator): string[] {
+    const opts = decorator.getArguments()[1];
+    if (!opts || !Node.isObjectLiteralExpression(opts)) return ['get'];
+
+    for (const prop of opts.getProperties()) {
+      if (!Node.isPropertyAssignment(prop)) continue;
+
+      const init = prop.getInitializer();
+
+      if (Node.isPropertyAccessExpression(init)) {
+        const verbs = REQUEST_METHODS[init.getName()];
+        if (verbs) return verbs;
+      } else if (Node.isNumericLiteral(init)) {
+        const member = REQUEST_METHOD_ORDER[init.getLiteralValue()];
+        if (member) return REQUEST_METHODS[member];
+      }
+    }
+    return ['get'];
   }
 
   /** Read a method-level `@Version(...)` decorator, or undefined when absent. */
@@ -331,7 +399,9 @@ export class PathBuilder {
     // `@Accept <type>` overrides the request body media type; `@ContentType
     // <type>` overrides the response media type. Both default to JSON.
     const methodTags = getTags(method);
-    const responseMediaType = methodTags.ContentType?.[0] || DEFAULT_MEDIA_TYPE;
+    const responseMediaType =
+      methodTags.ContentType?.[0] ||
+      (method.getDecorator('Sse') ? SSE_MEDIA_TYPE : DEFAULT_MEDIA_TYPE);
 
     const rawDesc = method.getJsDocs()[0]?.getCommentText();
     const desc = rawDesc
@@ -555,7 +625,10 @@ export class PathBuilder {
     mediaType: string,
   ): Record<string, OpenApiResponse> {
     let returnType = method.getReturnType();
-    if (AstIndex.symbolName(returnType) === 'Promise') {
+    // Unwrap the async carriers NestJS serializes through: a Promise, or the
+    // Observable an @Sse()/streaming handler returns (Observable<MessageEvent>).
+    const carrier = AstIndex.symbolName(returnType);
+    if (carrier === 'Promise' || carrier === 'Observable') {
       const args = returnType.getTypeArguments();
       if (args.length) returnType = args[0];
     }
@@ -635,6 +708,9 @@ export class PathBuilder {
         if (code !== undefined) return String(code);
       }
     }
+    // SSE streams respond 200 regardless of verb (the 201-for-POST default only
+    // makes sense for a created resource, not a long-lived event stream).
+    if (method.getDecorator('Sse')) return '200';
     return httpMethod === 'post' ? '201' : '200';
   }
 
