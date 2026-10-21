@@ -312,26 +312,7 @@
         "description": "Cheap liveness check with no body.",
         "responses": {
           "200": {
-            "description": "Successful response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean"
-                    },
-                    "message": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "success",
-                    "message"
-                  ]
-                }
-              }
-            }
+            "description": "Successful response"
           }
         },
         "security": []
@@ -604,30 +585,7 @@
         "description": "Catch-all echo handler, registered for every verb.",
         "responses": {
           "200": {
-            "description": "Successful response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "success": {
-                      "type": "boolean"
-                    },
-                    "message": {
-                      "type": "string"
-                    },
-                    "data": {
-                      "$ref": "#/components/schemas/HealthStatusDto"
-                    }
-                  },
-                  "required": [
-                    "success",
-                    "message",
-                    "data"
-                  ]
-                }
-              }
-            }
+            "description": "Successful response"
           }
         },
         "security": []

@@ -73,7 +73,7 @@ export async function parseNestProject(options: ParseNestProjectOptions): Promis
 
   // Global prefix and versioning: an explicit config field always wins; a
   // missing one is auto-detected from the project's bootstrap file.
-  const detected = detectBootstrap(index.project);
+  const detected = detectBootstrap(index.getSourceFiles());
   const globalPrefix = config.project?.globalPrefix ?? detected.globalPrefix;
   const versioning = resolveVersioning(config.project?.versioning, detected.versioning);
 

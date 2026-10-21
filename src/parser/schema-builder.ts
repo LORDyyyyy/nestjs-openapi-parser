@@ -533,12 +533,15 @@ function literalNumber(arg: Node | undefined): number | undefined {
 
 /** True if any decorator argument is an options object literal with `each: true`. */
 function hasEachOption(args: Node[]): boolean {
-  return args.some(
-    (arg) =>
-      Node.isObjectLiteralExpression(arg) &&
-      arg.getProperty('each') !== undefined &&
-      /\beach\s*:\s*true\b/.test(arg.getText()),
-  );
+  return args.some((arg) => {
+    if (!Node.isObjectLiteralExpression(arg)) return false;
+    const prop = arg.getProperty('each');
+    // Shorthand `{ each }` reads the `each` variable — treat it as truthy.
+    if (Node.isShorthandPropertyAssignment(prop)) return true;
+    return (
+      Node.isPropertyAssignment(prop) && prop.getInitializer()?.getKind() === SyntaxKind.TrueKeyword
+    );
+  });
 }
 
 /** The `items` schema of an array schema, created as an empty object if absent. */

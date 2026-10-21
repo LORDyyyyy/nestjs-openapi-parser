@@ -46,7 +46,6 @@ const CATS_CONTROLLER = `
 import { Controller, Get, Version, VERSION_NEUTRAL } from '@nestjs/common';
 
 @Controller('cats')
-@Version('1')
 export class CatsController {
   @Get()
   findAll(): string { return 'cats'; }
@@ -62,6 +61,10 @@ export class CatsController {
   @Get('ping')
   @Version(VERSION_NEUTRAL)
   ping(): string { return 'pong'; }
+
+  @Get('mixed')
+  @Version(['1', VERSION_NEUTRAL])
+  mixed(): string { return 'mixed'; }
 }
 `;
 
@@ -123,7 +126,7 @@ describe('bootstrap auto-detection', () => {
     const doc = await build();
     const paths = Object.keys(doc.paths);
 
-    // controller @Version('1') + global prefix
+    // no method @Version → detected defaultVersion '1' + global prefix
     expect(doc.paths['/api/v1/cats']?.get).toBeDefined();
     // method @Version('2') overrides the controller
     expect(doc.paths['/api/v2/cats/legacy']?.get).toBeDefined();
@@ -132,6 +135,9 @@ describe('bootstrap auto-detection', () => {
     expect(doc.paths['/api/v2/cats/multi']?.get).toBeDefined();
     // @Version(VERSION_NEUTRAL) → no version segment
     expect(doc.paths['/api/cats/ping']?.get).toBeDefined();
+    // @Version(['1', VERSION_NEUTRAL]) → both the v1 path and the unversioned one
+    expect(doc.paths['/api/v1/cats/mixed']?.get).toBeDefined();
+    expect(doc.paths['/api/cats/mixed']?.get).toBeDefined();
     // no @Version → detected defaultVersion '1'
     expect(doc.paths['/api/v1/dogs']?.get).toBeDefined();
 

@@ -10,7 +10,7 @@ import {
 import type { NestParserHooks } from '../config/types';
 import type { OpenApiResponse, OpenApiSchema, OpenApiSecurityRequirement } from '../types/openapi';
 import { AstIndex } from './ast-index';
-import type { ResolvedVersioning } from './bootstrap';
+import { readVersionValues, type ResolvedVersioning } from './bootstrap';
 import { SchemaBuilder } from './schema-builder';
 import { filterScopedComments, getScopes, getTags, isVisible } from './tags';
 
@@ -28,8 +28,7 @@ const HTTP_METHODS: Record<string, string> = {
 
 // @All() registers a handler for every verb. OpenAPI has no wildcard method, so
 // it expands to one operation per verb (operationIds de-dup, bodies/responses
-// are identical). ponytail: covers the common `@All()` catch-all; no per-verb
-// divergence because a single handler can't branch its contract by verb anyway.
+// are identical).
 const ALL_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'options', 'head'];
 
 // NestJS v11's `@Sse(path, { [METHOD_METADATA]: RequestMethod.X })` can override
@@ -125,13 +124,11 @@ function humanizeMethodName(name: string): string {
 
 /**
  * A resolved version requirement from `@Controller({ version })` or `@Version`.
- * `neutral` is `VERSION_NEUTRAL` (route stays unversioned); otherwise `versions`
- * holds one or more explicit versions.
+ * One entry per version to emit; an empty string is `VERSION_NEUTRAL` (no version
+ * segment). NestJS allows mixing them — `@Version(['1', VERSION_NEUTRAL])` serves
+ * both `/v1/...` and the unversioned route — so this stays a flat list.
  */
-interface VersionSpec {
-  neutral: boolean;
-  versions: string[];
-}
+type VersionSpec = string[];
 
 export interface PathBuilderOptions {
   globalPrefix?: string;
@@ -353,26 +350,23 @@ export class PathBuilder {
    */
   private versionSegments(version: VersionSpec | undefined): string[] {
     if (!this.versioning) return [''];
-    if (version?.neutral) return [''];
 
-    const versions = version ? version.versions : this.versioning.defaultVersion;
+    const versions = version ?? this.versioning.defaultVersion;
     if (versions.length === 0) return [''];
 
-    return versions.map((v) => `${this.versioning!.prefix}${v}`);
+    // '' (VERSION_NEUTRAL) stays an empty segment; everything else gets the prefix.
+    return [...new Set(versions.map((v) => (v === '' ? '' : `${this.versioning!.prefix}${v}`)))];
   }
 
   /**
-   * Interpret a version argument — a string, string[], or `VERSION_NEUTRAL`
-   * identifier. Returns undefined when absent; a non-literal/dynamic argument
-   * falls back to neutral (best-effort).
+   * Interpret a version argument — a string, `VERSION_NEUTRAL`, or an array
+   * mixing both — into the version list (`''` = neutral). Returns undefined when
+   * absent; a present-but-dynamic argument falls back to neutral (best-effort).
    */
   private readVersionSpec(node: Node | undefined): VersionSpec | undefined {
     if (!node) return undefined;
-    if (Node.isIdentifier(node) && node.getText() === 'VERSION_NEUTRAL') {
-      return { neutral: true, versions: [] };
-    }
-    const versions = this.stringLiterals(node);
-    return versions.length ? { neutral: false, versions } : { neutral: true, versions: [] };
+    const versions = readVersionValues(node);
+    return versions.length ? versions : [''];
   }
 
   /** Initializer of a named property in an object literal, or undefined. */
@@ -651,15 +645,26 @@ export class PathBuilder {
       if (parsed) responses[parsed.code] ??= { description: parsed.description };
     }
 
-    if (!this.hooks.buildResponses) return responses;
-    const ctx = {
-      controller,
-      method,
-      httpMethod,
-      successStatus: status,
-      typeToSchema: (t: Type) => this.schemaBuilder.typeToSchema(t),
-    };
-    return this.hooks.buildResponses(ctx, responses) ?? responses;
+    const finalized = this.hooks.buildResponses
+      ? (this.hooks.buildResponses(
+          {
+            controller,
+            method,
+            httpMethod,
+            successStatus: status,
+            typeToSchema: (t: Type) => this.schemaBuilder.typeToSchema(t),
+          },
+          responses,
+        ) ?? responses)
+      : responses;
+
+    // A HEAD response never carries a message body (RFC 9110 §9.3.2), so drop
+    // the content a return type or the envelope hook would otherwise attach.
+    if (httpMethod === 'head') {
+      for (const response of Object.values(finalized)) delete response.content;
+    }
+
+    return finalized;
   }
 
   /**
