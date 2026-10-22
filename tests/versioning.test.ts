@@ -130,7 +130,7 @@ describe('bootstrap auto-detection', () => {
 
     // no method @Version → detected defaultVersion '1' + global prefix
     expect(doc.paths['/api/v1/cats']?.get).toBeDefined();
-    // method @Version('2') overrides the controller
+    // method @Version('2') overrides the default version
     expect(doc.paths['/api/v2/cats/legacy']?.get).toBeDefined();
     // @Version(['1','2']) → one path per version
     expect(doc.paths['/api/v1/cats/multi']?.get).toBeDefined();
