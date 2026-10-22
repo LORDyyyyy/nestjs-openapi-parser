@@ -526,6 +526,26 @@ describe('output ordering', () => {
     ]);
   });
 
+  it('strips HEAD bodies without mutating response objects the hook shares', async () => {
+    // A config reusing one module-level response object across every endpoint.
+    const unauthorized = {
+      description: 'Unauthorized',
+      content: { 'application/json': { schema: { type: 'object' } } },
+    };
+    const document = await buildFixtureDocument({
+      hooks: {
+        ...(await loadFixtureConfig()).hooks,
+        buildResponses: (_ctx, responses) => ({ ...responses, '401': unauthorized }),
+      },
+    });
+    type Op = { responses: Record<string, { content?: unknown }> };
+    const echo = document.paths['/api/health/echo'] as Record<string, Op>;
+
+    expect(echo.head.responses['401'].content).toBeUndefined();
+    expect(echo.get.responses['401'].content).toBeDefined();
+    expect(unauthorized.content).toBeDefined();
+  });
+
   it('keeps model fields in their source-declaration order', async () => {
     const document = await buildFixtureDocument();
     const blogPost = document.components?.schemas?.BlogPost as {

@@ -660,8 +660,15 @@ export class PathBuilder {
 
     // A HEAD response never carries a message body (RFC 9110 §9.3.2), so drop
     // the content a return type or the envelope hook would otherwise attach.
+    // Copy rather than `delete` in place: the hook may hand back response
+    // objects it shares across operations (e.g. a module-level `UNAUTHORIZED`).
     if (httpMethod === 'head') {
-      for (const response of Object.values(finalized)) delete response.content;
+      return Object.fromEntries(
+        Object.entries(finalized).map(([code, { content: _content, ...bodyless }]) => [
+          code,
+          bodyless,
+        ]),
+      );
     }
 
     return finalized;
