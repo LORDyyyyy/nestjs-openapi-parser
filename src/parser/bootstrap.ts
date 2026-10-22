@@ -1,4 +1,4 @@
-import { Node, SourceFile, SyntaxKind } from 'ts-morph';
+import { Node, ObjectLiteralExpression, SourceFile, SyntaxKind } from 'ts-morph';
 import type { VersioningConfig } from '../config/types';
 
 export interface ResolvedVersioning {
@@ -29,7 +29,9 @@ const VERSIONING_TYPES: Record<string, ResolvedVersioning['type']> = {
  * Best-effort: calls whose arguments aren't literals are skipped (with a
  * warning — an explicit config field is the escape hatch).
  * Methods are matched by name only, so any `app`-like receiver works.
- * The first match of each kind wins.
+ * The first call of each kind wins — even an unreadable one, so a dynamic
+ * `setGlobalPrefix(process.env.PREFIX)` in `main.ts` doesn't fall through to a
+ * literal call in some other file.
  *
  * `sourceFiles` is already scoped to the project's rootDir with excludeSuffixes
  * applied (so `*.spec.ts`/`*.d.ts` are out), but `*.e2e-spec.ts` test apps and
@@ -39,6 +41,10 @@ const VERSIONING_TYPES: Record<string, ResolvedVersioning['type']> = {
  */
 export function detectBootstrap(sourceFiles: SourceFile[]): BootstrapInfo {
   const info: BootstrapInfo = {};
+  // Tracked apart from `info.globalPrefix` / `info.versioning`, which stay
+  // undefined when the call's argument can't be read statically.
+  let prefixSeen = false;
+  let versioningSeen = false;
 
   const bootstrapFiles: SourceFile[] = [];
   const others: SourceFile[] = [];
@@ -53,7 +59,8 @@ export function detectBootstrap(sourceFiles: SourceFile[]): BootstrapInfo {
 
       const name = callee.getName();
 
-      if (name === 'setGlobalPrefix' && info.globalPrefix === undefined) {
+      if (name === 'setGlobalPrefix' && !prefixSeen) {
+        prefixSeen = true;
         const arg = call.getArguments()[0];
         if (arg && Node.isStringLiteral(arg)) {
           info.globalPrefix = arg.getLiteralValue();
@@ -61,14 +68,17 @@ export function detectBootstrap(sourceFiles: SourceFile[]): BootstrapInfo {
           warnDynamic('setGlobalPrefix', arg);
         }
         // TODO: support `app.setGlobalPrefix('...', { exclude: ['/health', { path: 'robots.txt', method: RequestMethod.GET }] })`
-      } else if (name === 'enableVersioning' && info.versioning === undefined) {
+      } else if (name === 'enableVersioning' && !versioningSeen) {
+        versioningSeen = true;
         const arg = call.getArguments()[0];
+        // Don't guess the strategy from an options variable: assuming URI would
+        // add (or omit) version segments NestJS doesn't serve.
         if (arg && !Node.isObjectLiteralExpression(arg)) warnDynamic('enableVersioning', arg);
-        info.versioning = readVersioning(arg);
+        else info.versioning = readVersioning(arg);
       }
     }
 
-    if (info.globalPrefix !== undefined && info.versioning !== undefined) break;
+    if (prefixSeen && versioningSeen) break;
   }
 
   return info;
@@ -102,41 +112,67 @@ export function normalizeVersioning(config: VersioningConfig): ResolvedVersionin
   };
 }
 
-function readVersioning(arg: Node | undefined): ResolvedVersioning {
+function warnDynamicOption(node: Node, consequence: string): void {
+  console.warn(
+    `[nestparser] app.enableVersioning(...) option "${node.getText()}" isn't a static ` +
+      `literal, so ${consequence}. Set \`project.versioning\` explicitly in the parser config.`,
+  );
+}
+
+/**
+ * Read an `enableVersioning(...)` options object literal. Unreadable members are
+ * reported: a dynamic `type` drops versioning altogether (the strategy decides
+ * whether paths change at all), while a dynamic `prefix` / `defaultVersion` (or
+ * a spread) only falls back to the default for that field.
+ */
+function readVersioning(arg: ObjectLiteralExpression | undefined): ResolvedVersioning | undefined {
   // `enableVersioning()` with no options defaults to URI versioning.
   const result: ResolvedVersioning = { type: 'uri', prefix: 'v', defaultVersion: [] };
+  if (!arg) return result;
 
-  if (!arg || !Node.isObjectLiteralExpression(arg)) return result;
+  for (const prop of arg.getProperties()) {
+    if (!Node.isPropertyAssignment(prop)) warnDynamicOption(prop, 'it was ignored');
+  }
 
-  const type = arg.getProperty('type');
-
-  if (type && Node.isPropertyAssignment(type)) {
-    const init = type.getInitializer();
-
+  const type = propertyInitializer(arg, 'type');
+  if (type) {
     // `VersioningType.URI` reads the member name; fall back to a plain string.
-    if (init && Node.isPropertyAccessExpression(init)) {
-      result.type = VERSIONING_TYPES[init.getName()] ?? result.type;
-    } else if (init && Node.isStringLiteral(init)) {
-      result.type = VERSIONING_TYPES[init.getLiteralValue().toUpperCase()] ?? result.type;
+    const resolved = Node.isPropertyAccessExpression(type)
+      ? VERSIONING_TYPES[type.getName()]
+      : Node.isStringLiteral(type)
+        ? VERSIONING_TYPES[type.getLiteralValue().toUpperCase()]
+        : undefined;
+    if (!resolved) {
+      warnDynamicOption(type, 'versioning was skipped');
+      return undefined;
     }
+    result.type = resolved;
   }
 
-  const prefix = arg.getProperty('prefix');
-  if (prefix && Node.isPropertyAssignment(prefix)) {
-    const init = prefix.getInitializer();
-
+  const prefix = propertyInitializer(arg, 'prefix');
+  if (prefix) {
     // `prefix: false` disables the prefix in NestJS.
-    if (init && Node.isStringLiteral(init)) result.prefix = init.getLiteralValue();
-    else if (init && init.getText() === 'false') result.prefix = '';
+    if (Node.isStringLiteral(prefix)) result.prefix = prefix.getLiteralValue();
+    else if (prefix.getKind() === SyntaxKind.FalseKeyword) result.prefix = '';
+    else warnDynamicOption(prefix, `\`prefix\` was left at its default '${result.prefix}'`);
   }
 
-  const def = arg.getProperty('defaultVersion');
-  if (def && Node.isPropertyAssignment(def)) {
-    const init = def.getInitializer();
-    if (init) result.defaultVersion = readVersionValues(init);
+  const def = propertyInitializer(arg, 'defaultVersion');
+  if (def) {
+    const nodes = Node.isArrayLiteralExpression(def) ? def.getElements() : [def];
+    if (nodes.some((n) => readVersionValue(n) === undefined)) {
+      warnDynamicOption(def, 'its non-literal entries were dropped');
+    }
+    result.defaultVersion = readVersionValues(def);
   }
 
   return result;
+}
+
+/** Initializer of a `name: value` member of an object literal, or undefined. */
+function propertyInitializer(obj: ObjectLiteralExpression, name: string): Node | undefined {
+  const prop = obj.getProperty(name);
+  return Node.isPropertyAssignment(prop) ? prop.getInitializer() : undefined;
 }
 
 /**
@@ -145,14 +181,15 @@ function readVersioning(arg: Node | undefined): ResolvedVersioning {
  * a deduped version list. Non-literal / dynamic entries are dropped (best-effort).
  */
 export function readVersionValues(node: Node): string[] {
-  const toValue = (n: Node): string | undefined => {
-    if (Node.isStringLiteral(n)) return n.getLiteralValue();
-    if (Node.isIdentifier(n) && n.getText() === 'VERSION_NEUTRAL') return '';
-    return undefined;
-  };
-
   const nodes = Node.isArrayLiteralExpression(node) ? node.getElements() : [node];
-  return [...new Set(nodes.map(toValue).filter((v): v is string => v !== undefined))];
+  return [...new Set(nodes.map(readVersionValue).filter((v): v is string => v !== undefined))];
+}
+
+/** A single version entry: a string literal, or `VERSION_NEUTRAL` → `''`. */
+function readVersionValue(node: Node): string | undefined {
+  if (Node.isStringLiteral(node)) return node.getLiteralValue();
+  if (Node.isIdentifier(node) && node.getText() === 'VERSION_NEUTRAL') return '';
+  return undefined;
 }
 
 function toArray(value: string | string[] | undefined): string[] {

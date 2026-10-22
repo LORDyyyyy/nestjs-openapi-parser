@@ -50,7 +50,7 @@ Both the global prefix and URI versioning are **auto-detected** from the project
 - `app.setGlobalPrefix('api')` → `project.globalPrefix`
 - `app.enableVersioning({ type: VersioningType.URI, prefix: 'v', defaultVersion: '1' })` → `project.versioning`
 
-An explicit config field always wins over detection. Set `globalPrefix: ''` to force no prefix, or `versioning: false` to disable versioning entirely. Detection is best-effort: if a call's argument isn't a string/object literal (e.g. it comes from an env var), it's skipped — set the field explicitly in that case.
+An explicit config field always wins over detection. Set `globalPrefix: ''` to force no prefix, or `versioning: false` to disable versioning entirely. Detection is best-effort: if a call's argument isn't a string/object literal (e.g. it comes from an env var), it's skipped with a warning — set the field explicitly in that case. Only the first call of each kind counts (the file calling `NestFactory.create` is read first), so an unreadable call in `main.ts` never falls back to a call in another file. Inside a literal `enableVersioning({ ... })`, a dynamic `type` skips versioning entirely (the strategy decides whether paths change), while a dynamic `prefix` / `defaultVersion` entry or a spread only falls back to the default for that field — each with a warning.
 
 ### Versioning
 

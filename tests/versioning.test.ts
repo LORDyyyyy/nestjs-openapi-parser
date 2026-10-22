@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Project } from 'ts-morph';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { parseNestProject } from '../src/lib';
+import { detectBootstrap, type BootstrapInfo } from '../src/parser/bootstrap';
 import type { NestParserConfig } from '../src/lib';
 import type { OpenApiDocument } from '../src/types/openapi';
 
@@ -170,5 +172,76 @@ describe('bootstrap auto-detection', () => {
     // global prefix still detected, but no version segments
     expect(doc.paths['/api/cats']?.get).toBeDefined();
     expect(doc.paths['/api/v1/cats']).toBeUndefined();
+  });
+});
+
+describe('detectBootstrap', () => {
+  // Detect from in-memory files, listed in traversal order; `main.ts` calls
+  // NestFactory.create so it's scanned first regardless of its position.
+  function detect(files: Record<string, string>): { info: BootstrapInfo; warnings: string[] } {
+    const project = new Project({ useInMemoryFileSystem: true });
+    const sourceFiles = Object.entries(files).map(([name, code]) =>
+      project.createSourceFile(`src/${name}`, code),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const info = detectBootstrap(sourceFiles);
+      return { info, warnings: warn.mock.calls.map(([msg]) => String(msg)) };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  const BOOT = 'const app = NestFactory.create(AppModule);';
+
+  it("doesn't fall back to another file when main.ts's prefix isn't a literal", () => {
+    const { info, warnings } = detect({
+      'other.ts': "app.setGlobalPrefix('other');",
+      'main.ts': `${BOOT} app.setGlobalPrefix(process.env.PREFIX);`,
+    });
+    expect(info.globalPrefix).toBeUndefined();
+    expect(warnings).toEqual([expect.stringContaining('process.env.PREFIX')]);
+  });
+
+  it("skips versioning (no URI guess, no fallback) when main.ts's options aren't a literal", () => {
+    const { info, warnings } = detect({
+      'other.ts': "app.enableVersioning({ type: VersioningType.URI, defaultVersion: '9' });",
+      'main.ts': `${BOOT} app.enableVersioning(versioningOptions);`,
+    });
+    expect(info.versioning).toBeUndefined();
+    expect(warnings).toEqual([expect.stringContaining('versioningOptions')]);
+  });
+
+  it('skips versioning when the `type` option is dynamic', () => {
+    const { info, warnings } = detect({
+      'main.ts': `${BOOT} app.enableVersioning({ type: config.versioningType, defaultVersion: '1' });`,
+    });
+    expect(info.versioning).toBeUndefined();
+    expect(warnings).toEqual([expect.stringContaining('versioning was skipped')]);
+  });
+
+  it('keeps the readable options and warns about each dynamic one', () => {
+    const { info, warnings } = detect({
+      'main.ts': `${BOOT} app.enableVersioning({
+        ...baseOptions,
+        type: VersioningType.URI,
+        prefix: process.env.VERSION_PREFIX,
+        defaultVersion: ['2', process.env.API_VERSION],
+      });`,
+    });
+    expect(info.versioning).toEqual({ type: 'uri', prefix: 'v', defaultVersion: ['2'] });
+    expect(warnings).toEqual([
+      expect.stringContaining('...baseOptions'),
+      expect.stringContaining('`prefix` was left at its default'),
+      expect.stringContaining('non-literal entries were dropped'),
+    ]);
+  });
+
+  it('reads fully literal options without warnings', () => {
+    const { info, warnings } = detect({
+      'main.ts': `${BOOT} app.enableVersioning({ type: VersioningType.URI, prefix: false, defaultVersion: ['1', VERSION_NEUTRAL] });`,
+    });
+    expect(info.versioning).toEqual({ type: 'uri', prefix: '', defaultVersion: ['1', ''] });
+    expect(warnings).toEqual([]);
   });
 });
